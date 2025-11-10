@@ -337,7 +337,7 @@ def timer(func):
     return wrapper
 
 # Замените токен на свой
-API_TOKEN = '7885126039:'
+API_TOKEN = os.getenv("API_TOKEN")
 bot = Bot(token=API_TOKEN)
 router = Router()
 
