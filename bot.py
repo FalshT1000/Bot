@@ -565,7 +565,7 @@ async def convert_fb2_to_html(fb2_file, output_html_filename):
                             print(f"FB2: Данные для изображения '{image_id_ref}' не найдены.")
                     else:
                         print(f"FB2: Тег <image> без корректной ссылки: {element}")
-            print(html_lines)
+            # print(html_lines)
             split_html("".join(html_lines), output_html_filename)
             return True
         except Exception as e:
