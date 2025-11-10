@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # Установка зависимостей
-#!pip install python-docx docxcompose beautifulsoup4 ebooklib aiogram aiofiles nest_asyncio
-
+import mammoth
 import os
 import re
 import time
@@ -16,6 +15,7 @@ import io
 from io import BytesIO
 import base64
 import posixpath
+import sqlite3
 from docxcompose.composer import Composer
 from bs4 import BeautifulSoup
 import ebooklib
@@ -29,19 +29,48 @@ import aiofiles
 import asyncio
 import nest_asyncio
 import concurrent.futures
+import html
+import chardet
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
 from aiogram.fsm.state import StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from functools import partial
-from collections import deque
+from collections import deque, defaultdict
 from datetime import datetime, timezone, timedelta
 nest_asyncio.apply()
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardRemove
 from aiogram.exceptions import TelegramBadRequest
-
+from asyncio import Queue, create_task, sleep
+from ebooklib import ITEM_IMAGE, ITEM_DOCUMENT
 # Создаем пул потоков для выполнения CPU-bound задач
 thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+group_queues = defaultdict(Queue)
+group_tasks = {}
+
+async def group_message_sender(chat_id):
+    queue = group_queues[chat_id]
+    while True:
+        message, text, future = await queue.get()
+        try:
+            bot_message = await message.answer(text)
+            future.set_result(bot_message)
+        except Exception as e:
+            future.set_exception(e)
+            print(f"Ошибка при отправке в чат {chat_id}: {e}")
+        await sleep(3.1)
+        queue.task_done()
+
+async def enqueue_group_message(chat_id, message, text):
+    queue = group_queues[chat_id]
+
+    if chat_id not in group_tasks:
+        task = create_task(group_message_sender(chat_id))
+        group_tasks[chat_id] = task
+
+    future = asyncio.get_running_loop().create_future()
+    await queue.put((message, text, future))
+    return await future
 
 async def set_bot_commands(bot: Bot):
     commands = [
@@ -95,8 +124,27 @@ async def del_msg(chat_id, list_delete_message):
         try:
            await bot.delete_message(chat_id, msg_id)
            await asyncio.sleep(0.1)
-        except TelegramBadRequest: pass
-        except Exception as e: print(f"Ошибка удаления сообщения {msg_id} при end_merge: {e}")
+        except TelegramBadRequest:
+            pass
+        except Exception as e:
+            print(f"Ошибка удаления сообщения {msg_id} при end_merge: {e}")
+
+def detect_encoding(file_path, default='utf-8'):
+    """Определяет кодировку FB2-файла."""
+    try:
+        with open(file_path, 'rb') as f:
+            raw_data = f.read(4096)  # читаем первые 4 КБ
+        result = chardet.detect(raw_data)
+        encoding = result.get('encoding')
+        if encoding:
+            print(f"Определена кодировка: {encoding}")
+            return encoding
+        else:
+            print(f"Не удалось определить кодировку, используется по умолчанию: {default}")
+            return default
+    except Exception as e:
+        print(f"Ошибка при определении кодировки: {e}")
+        return default
 
 class UserLimits:
     def __init__(self, max_files, max_size):
@@ -106,7 +154,7 @@ class UserLimits:
         self.max_files = max_files
         self.max_size = max_size
         self.admins = [5787446293, 5491435817]
-        
+
     def _get_last_utc_midnight(self):
         """Возвращает последнюю полночь по UTC."""
         now = datetime.now(timezone.utc)
@@ -137,7 +185,7 @@ class UserLimits:
 
         if user_id in self.admins:
             return True, ""
-            
+
         if self.user_data[user_id]['files_today'] == self.max_files:
             time_left = (self.last_global_reset + timedelta(days=1)) - now
             hours_left = time_left.seconds // 3600
@@ -154,7 +202,7 @@ class UserLimits:
             self.user_data[user_id]['files_today'] -= count
 
 # Создаем экземпляр класса лимитов
-user_limits = UserLimits(max_files=30, max_size=15)
+user_limits = UserLimits(max_files=30, max_size=20)
 
 # Система очереди
 class TaskQueue:
@@ -219,8 +267,63 @@ class TaskQueue:
         """Проверка, можно ли обработать следующую задачу из очереди"""
         return len(self.active_tasks) < self.max_concurrent_tasks and self.queue
 
+class ChapterStore:
+    def __init__(self):
+        self.image_index = 0
+        self.file_index = 0
+        self.toc = {}
+        self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute("""
+        CREATE TABLE chapters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            file_name TEXT,
+            content TEXT
+        )
+        """)
+        self.cursor.execute("""
+        CREATE TABLE images (
+            name TEXT,
+            data BLOB
+        )
+        """)
+    def add(self, title, file_name, content):
+        self.cursor.execute("INSERT INTO chapters (title, file_name, content) VALUES (?, ?, ?)", (title, file_name, content))
+
+    def file_name(self):
+        file_name=f"chapter_{self.file_index+1:02d}.xhtml"
+        self.file_index +=1
+        return file_name
+
+    def toc_update(self, new_toc):
+        self.toc.update(new_toc)
+
+    def get_toc(self):
+        return self.toc
+
+    def iter_chapters(self):
+        for row in self.cursor.execute("SELECT title, file_name, content FROM chapters ORDER BY id"):
+            yield row
+
+    def save_image(self, binary_data):
+        self.image_index += 1
+        image_name = f"img{self.image_index}.jpg"
+        self.cursor.execute("INSERT INTO images (name, data) VALUES (?, ?)", (image_name, binary_data))
+        return image_name
+
+    def clear(self):
+        self.cursor.execute("DELETE FROM chapters")
+        self.cursor.execute("DELETE FROM images")
+        self.image_index = 0
+        self.file_index = 0
+        self.toc = {}
+        self.conn.commit()
+
 # Создаем очередь задач
-task_queue = TaskQueue(max_concurrent_tasks=1)  # Максимум 5 одновременных задач
+task_queue = TaskQueue(max_concurrent_tasks=1)  # Максимум 1 одновременных задач
+# Создаем базу данных
+store = ChapterStore()
 
 # Декоратор для измерения времени выполнения функции
 def timer(func):
@@ -237,90 +340,185 @@ API_TOKEN = os.getenv("API_TOKEN")
 bot = Bot(token=API_TOKEN)
 router = Router()
 
-# ===================== Неблокирующие функции конвертации =====================
-
 # Функция-обертка для выполнения блокирующих операций в отдельном потоке
 async def run_in_threadpool(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     func_partial = partial(func, *args, **kwargs)
     return await loop.run_in_executor(thread_pool, func_partial)
 
-# Неблокирующие версии функций конвертации
-async def convert_epub_to_docx(epub_file, docx_file):
+def extract_text_only(input_path):
+    """
+    Извлекает только текст и создает новый простой документ
+    """
+    try:
+        # Загружаем документ
+        doc = Document(input_path)
+        # Создаем новый документ
+        new_doc = Document()
+
+        # Копируем только текст без форматирования
+        for paragraph in doc.paragraphs:
+            new_paragraph = new_doc.add_paragraph(paragraph.text)
+        new_doc.save(input_path)
+        return input_path
+
+    except Exception as e:
+        print(f"Ошибка извлечения текста: {e}")
+        return None
+
+def check_title(soup, file_name):
+    """
+    Проверяет наличие заголовка H1 в начале HTML-контента.
+    Если заголовок не найден, добавляет его на основе имени файла.
+    """
+    # Паттерны для автоматического определения заголовков
+    patterns = [
+        r'Глава[ ]{0,4}\d{1,4}',
+        r'Часть[ ]{0,4}\d{1,4}',
+        r'^Пролог[ .!]*$',
+        r'^Описание[ .!]*$',
+        r'^Аннотация[ .!]*$',
+        r'^Annotation[ .!]*$',
+        r'^Предисловие от автора[ .!]*$'
+        ]
+    content = soup.body or soup
+    elements = content.find_all(recursive=False)[:4]
+    try:
+        # Проверка первых 4 элементов контента
+        title_found = False
+        for element in elements:
+            # Проверка тегов h1-h6
+            if element.name.lower() in {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}:
+                title_found = True
+                break
+
+        if not title_found:
+            for element in elements:
+                # Проверка текстового содержания
+                text = element.get_text().strip()
+                if any(re.search(pattern, text) for pattern in patterns):
+                    element.name = 'h1'
+                    content.insert(0, element)
+                    title_found = True
+                    break
+
+        # Добавление заголовка при необходимости
+        if not title_found:
+            base_name = os.path.splitext(os.path.basename(file_name))[0]
+            if re.match(r'^\d+$', base_name):
+                title = f'Глава {base_name}'
+            else:
+                title = base_name
+            new_h1 = soup.new_tag('h1')
+            new_h1.string = title
+            content.insert(0, new_h1)
+
+        return soup
+    except Exception as e:
+        print(f"Ошибка при обработке HTML: {e}")
+        return soup
+
+def split_html(raw_html, file_name):
+    """
+    Преобразует HTML в XHTML и разбивает по <h1> на отдельные главы.
+    Добавляет их в бд.
+    """
+    # Приводим к валидному XHTML
+    soup = BeautifulSoup(raw_html, "lxml")
+    # print(soup)
+    soup = check_title(soup, file_name)
+
+    # Разбиваем по <h1>
+    current_chapter = []
+    title = None
+    for elem in soup.body or soup: # Поддержка случая без <body>
+        if not getattr(elem, 'name', None):
+            current_chapter.append(elem)
+            continue
+        if elem.name.lower() in {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}:
+            # Если начали новую главу — сохраняем старую (если есть)
+            if current_chapter:
+                if title:
+                    chapter_name = store.file_name()
+                    store.add(title, chapter_name, "".join(str(e) for e in current_chapter))
+                    # print(title, chapter_name, "".join(str(e) for e in current_chapter))
+                    current_chapter = []
+            title = elem.text
+        current_chapter.append(elem)
+
+    # Последняя глава
+    if current_chapter:
+        chapter_name = store.file_name()
+        store.add(title, chapter_name, "".join(str(e) for e in current_chapter))
+        # print(title, chapter_name, "".join(str(e) for e in current_chapter))
+        current_chapter = []
+    return
+
+def convert_image(image):
+    with image.open() as image_file:
+        original_bytes = image_file.read()
+
+    # Конвертируем в JPEG через Pillow
+    try:
+        buf = io.BytesIO()
+        Image.open(io.BytesIO(original_bytes)).convert("RGB").save(buf, format="JPEG", quality=70)
+        buf.seek(0)
+        image_name = store.save_image(buf.read())  # ← вернёт 'img1.jpg' и т.п.
+        return {"src": f"images/{image_name}"}
+    except Exception as img_e:
+        print(f"DOCX: Ошибка добавления изображения в БД: {img_e}")
+        return
+
+# ===================== Неблокирующие функции конвертации =====================
+async def convert_docx_to_html(docx_file_path, output_html_filename):
+    """Асинхронно конвертирует DOCX файл в HTML строку с помощью mammoth."""
     def _convert():
-        document = Document()
         try:
-            # Открываем EPUB-файл
-            book = epub.read_epub(epub_file)
-            spine_ids = [item[0] for item in book.spine]  # [ 'titlepage', 'Section0001.html', ... ]
-            # Перебираем элементы книги
-            for id_ in spine_ids:
-                item = book.get_item_with_id(id_)
-                if item.get_type() == ebooklib.ITEM_DOCUMENT:
-                    soup = BeautifulSoup(item.content, 'html.parser')
-                    html_base_path = posixpath.dirname(item.get_name())
-                    for element in soup.find_all():
-                        if element.name == 'h1':
-                            document.add_heading(element.get_text(), level=1)
-                        elif element.name == 'p':
-                            doc_paragraph = document.add_paragraph()
-                            # Перебор вложенных элементов абзаца
-                            for sub in element.contents:
-                                if hasattr(sub, 'name'):
-                                    if sub.name == 'strong':
-                                        run = doc_paragraph.add_run(sub.get_text())
-                                        run.bold = True
-                                    elif sub.name == 'em':
-                                        run = doc_paragraph.add_run(sub.get_text())
-                                        run.italic = True
-                                    else:
-                                        doc_paragraph.add_run(sub.get_text())
-                                else:
-                                    # Если это просто текст
-                                    doc_paragraph.add_run(sub)
-                        # Обработка тегов изображений <img>
-                        elif element.name == 'img':
-                            src = element.get('src')
-                            if src:
-                                try:
-                                    # Формируем полный путь к изображению внутри EPUB
-                                    image_href = posixpath.normpath(posixpath.join(html_base_path, src))
-                                    # Ищем элемент изображения в книге по его пути (href)
-                                    img_item = book.get_item_with_href(image_href)
-
-                                    if img_item and img_item.get_type() == ebooklib.ITEM_IMAGE:
-                                        # Получаем бинарные данные изображения
-                                        image_data = img_item.content
-                                        try:
-                                            f = io.BytesIO()
-                                            Image.open(io.BytesIO(image_data)).convert('RGB').save(f, format='JPEG', quality=70)
-                                            document.add_picture(f, width=Inches(5.5))
-                                        except Exception as img_e:
-                                            print(f"EPUB: Ошибка добавления изображения '{image_href}' в DOCX: {img_e}")
-                                            document.add_paragraph(f"[Ошибка добавления изображения: {image_href}]")
-                                    else:
-                                        print(f"Предупреждение: Не найден элемент изображения или тип не ITEM_IMAGE для href: {image_href} (src: {src})")
-                                except KeyError:
-                                    # Если get_item_with_href не нашел элемент
-                                     print(f"Предупреждение: Не найден элемент изображения в манифесте EPUB для href: {image_href} (src: {src}) в файле {item.get_name()}")
-                                except Exception as img_e:
-                                    print(f"Ошибка при обработке изображения {src} в файле {item.get_name()}: {img_e}")
+            with open(docx_file_path, "rb") as docx_file_obj:
+                result = mammoth.convert_to_html(docx_file_obj, convert_image=mammoth.images.img_element(convert_image))
+            split_html(result.value, output_html_filename)
+            return True
         except Exception as e:
-            print(f"Ошибка конвертации EPUB {epub_file}: {e}")
-            document.add_paragraph(f"Ошибка конвертации файла {os.path.basename(epub_file)}: {e}")
-        finally:
-            document.save(docx_file)
-
+            print(f"Ошибка конвертации DOCX '{docx_file_path}' в HTML: {e}. Попытаюсь извлечь текст")
+            try:
+                cleaned_path = extract_text_only(docx_file_path)
+                if docx_file_path:
+                    with open(cleaned_path, "rb") as docx_file_obj:
+                        result = mammoth.convert_to_html(docx_file_obj, convert_image=mammoth.images.img_element(convert_image))
+                    split_html(result.value, output_html_filename)
+                    return True
+            except Exception as e:
+                print(f"Ошибка конвертации DOCX '{docx_file_path}' в HTML: {e}. Извлечение текста не помогло.")
+                return False # Возвращаем False в случае ошибки
     return await run_in_threadpool(_convert)
 
-async def convert_fb2_to_docx(fb2_file, docx_file):
+async def convert_txt_to_html(txt_file, output_html_filename):
+    """Асинхронно конвертирует DOCX файл в HTML строку с помощью mammoth."""
     def _convert():
-        document = Document()
+        try:
+            with open(txt_file, 'r', encoding='utf-8') as f:
+                text = f.read()
+            html_lines = []
+            for line in text.splitlines():
+                html_lines.append(f"<p>{html.escape(line)}</p>")
+            # Передаем полученный html в бд
+            split_html("".join(html_lines), output_html_filename)
+            return True
+        except Exception as e:
+            print(f"Ошибка конвертации TXT '{txt_file}' в HTML: {e}.")
+            return False # Возвращаем False в случае ошибки
+    return await run_in_threadpool(_convert)
+
+async def convert_fb2_to_html(fb2_file, output_html_filename):
+    def _convert():
+        html_lines = []
         image_data_map = {} # Словарь для раскодированных изображений {id: image_bytes}
         try:
-            with open(fb2_file, 'r', encoding='utf-8') as f:
+            encoding = detect_encoding(fb2_file)
+            with open(fb2_file, 'r', encoding=encoding) as f:
                 content = f.read()
-            soup = BeautifulSoup(content, 'xml')
+            soup = BeautifulSoup(content, 'html')
+            # print(soup)
             # Извлечение и декодирование всех изображений
             for binary_tag in soup.find_all('binary'):
                 image_id = binary_tag.get('id')
@@ -328,72 +526,159 @@ async def convert_fb2_to_docx(fb2_file, docx_file):
                 data = binary_tag.text.strip()
                 if image_id and data and content_type.startswith('image/'):
                     try:
-                        image_bytes = base64.b64decode(data)
-                        image_data_map[image_id] = image_bytes
-                    except Exception as b64e:
-                        print(f"FB2: Ошибка декодирования base64 для ID '{image_id}': {b64e}")
+                        buf = io.BytesIO()
+                        Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB").save(buf, format="JPEG", quality=70)
+                        buf.seek(0)
+                        image_name = store.save_image(buf.read())
+                        image_data_map[image_id] = f"images/{image_name}"
+                    except Exception as img_e:
+                        print(f"FB2: Ошибка добавления изображения '{image_id}' в БД: {img_e}")
             # Парсим остальные части документа
             for element in soup.find_all(['title', 'p', 'image']):
                 if element.name == 'title':
-                    document.add_heading(element.get_text(), level=1)
+                    html_lines.append(f"<h1>{html.escape(element.get_text())}</h1>")
                 elif element.name == 'p':
+                    # print(element)
                     # Если абзац не является частью title или annotation
                     if element.find_parent(['title', 'annotation']) is None:
-                        doc_paragraph = document.add_paragraph()
+                        paragraph = ""
                         for sub in element.contents:
                             if hasattr(sub, 'name'):
                                 if sub.name == 'strong':
-                                    run = doc_paragraph.add_run(sub.get_text())
-                                    run.bold = True
+                                    paragraph = paragraph + (f"<strong>{html.escape(sub.get_text())}</strong>")
                                 elif sub.name == 'emphasis':
-                                    run = doc_paragraph.add_run(sub.get_text())
-                                    run.italic = True
+                                    paragraph = paragraph + (f"<em>{html.escape(sub.get_text())}</em>")
                                 else:
-                                    doc_paragraph.add_run(sub.get_text())
+                                    paragraph = paragraph + html.escape(sub.get_text())
                             else:
-                                doc_paragraph.add_run(sub)
+                                paragraph = paragraph + html.escape(sub)
+                        html_lines.append(f"<p>{paragraph}</p>")
                 # Обработка тега image
                 elif element.name == 'image':
                     href_attr = element.get('l:href') or element.get('xlink:href')
                     if href_attr and href_attr.startswith('#'):
                         image_id_ref = href_attr[1:]
                         if image_id_ref in image_data_map:
-                            image_bytes = image_data_map[image_id_ref]
-                            try:
-                                f = io.BytesIO()
-                                Image.open(io.BytesIO(image_bytes)).convert('RGB').save(f, format='JPEG', quality=70)
-                                document.add_picture(f, width=Inches(5.5))
-                            except Exception as img_e:
-                                print(f"FB2: Ошибка добавления изображения '{image_id_ref}' в DOCX: {img_e}")
-                                document.add_paragraph(f"[Ошибка добавления изображения: {image_id_ref}]")
+                            image_name = image_data_map[image_id_ref]
+                            html_lines.append(f'<img src="{image_name}">')
                         else:
                             print(f"FB2: Данные для изображения '{image_id_ref}' не найдены.")
-                            document.add_paragraph(f"[Изображение не найдено: {image_id_ref}]")
                     else:
                         print(f"FB2: Тег <image> без корректной ссылки: {element}")
-                        document.add_paragraph("[Некорректный тег image]")
+            print(html_lines)
+            split_html("".join(html_lines), output_html_filename)
+            return True
         except Exception as e:
             print(f"Ошибка конвертации FB2 {fb2_file}: {e}")
-            document.add_paragraph(f"Ошибка конвертации файла {os.path.basename(fb2_file)}: {e}")
-        finally:
-            document.save(docx_file)
+            return False
     return await run_in_threadpool(_convert)
 
-async def convert_txt_to_docx(txt_file, docx_file):
+async def convert_epub_to_html(epub_file, output_html_filename):
     def _convert():
         try:
-            with open(txt_file, 'r', encoding='utf-8') as f:
-                text = f.read()
-            document = Document()
-            for line in text.splitlines():
-                document.add_paragraph(line)
+            book = epub.read_epub(epub_file)
+            # Извлекаем оглавление и создаём grouped_by_file
+            def flatten_toc(toc):
+                result = []
+                def walk(items):
+                    for item in items:
+                        if isinstance(item, epub.Link):
+                            result.append(item)
+                        elif isinstance(item, tuple):
+                            # item[0] может быть Section или Link
+                            if isinstance(item[0], epub.Link):
+                                result.append(item[0])
+                            elif isinstance(item[0], epub.Section):
+                                if item[0].href:
+                                    result.append(epub.Link(item[0].href, item[0].title))
+                            # рекурсивно идём внутрь, даже если это Section
+                            walk(item[1])
+                        elif isinstance(item, epub.EpubHtml):
+                            result.append(epub.Link(item.file_name, item.title))
+
+                walk(toc)
+                return result
+            toc_links = flatten_toc(book.toc)
+            # print(book.toc)
+            href_counts = defaultdict(int)
+            for link in toc_links:
+                name = link.href.split('#')[0]
+                href_counts[name] += 1
+
+            grouped_by_file = defaultdict(list)
+            for link in toc_links:
+                name = link.href.split('#')[0]
+                if href_counts[name] > 1:
+                    grouped_by_file[name].append((link.title, link.href))
+
+            # Сохраняем изображения
+            image_map = {}
+            for item in book.get_items():
+                if item.get_type() == ITEM_IMAGE:
+                    try:
+                        full_path = item.file_name
+                        buf = io.BytesIO()
+                        Image.open(io.BytesIO(item.get_content())).convert("RGB").save(buf, format="JPEG", quality=70)
+                        buf.seek(0)
+                        new_name = store.save_image(buf.read())
+                        image_map[full_path] = f"images/{new_name}"
+                    except Exception as img_e:
+                        print(f"EPUB: Ошибка добавления изображения '{full_path}' в БД: {img_e}")
+
+            # Обрабатываем HTML-документы
+            for idref, _ in book.spine:
+                item = book.get_item_with_id(idref)
+                if item is None or item.get_type() != ITEM_DOCUMENT:
+                    continue
+
+                soup = BeautifulSoup(item.get_content(), 'lxml')
+
+                # Заменяем пути к изображениям
+                for img in soup.find_all(['img', 'image']):
+                    src = img.get('src') or img.get('xlink:href')
+                    if src:
+                        abs_src = posixpath.normpath(posixpath.join(item.file_name, '..', src))
+                        if abs_src in image_map:
+                            if img.name == 'img':
+                                img['src'] = image_map[abs_src]
+                            else:
+                                img['xlink:href'] = image_map[abs_src]
+                        else:
+                            img.decompose()
+
+                orig_name = item.get_name() # ты можешь изменить на item.get_title(), если нужно
+                title = ""
+                for link in toc_links:
+                    name = link.href.split('#')[0]
+                    if orig_name == name:
+                        title = link.title # берём первый попавшийся title. Всё равно настоящее оглавление зададим через словарь.
+                        # print("Title:", title)
+                        break
+                chapter_name = store.file_name()
+                # Переназываем ключи и href в grouped_by_file
+                if orig_name in grouped_by_file:
+                    # Получаем записи для текущего файла
+                    entries = grouped_by_file[orig_name]
+                    # Удаляем старый ключ
+                    del grouped_by_file[orig_name]
+                    # Создаем новые записи с обновленными href
+                    new_entries = []
+                    for en_title, href in entries:
+                        if '#' in href:
+                            anchor = href.split('#', 1)[1]
+                            new_href = f"{chapter_name}#{anchor}"
+                        else:
+                            new_href = chapter_name
+                        new_entries.append((en_title, new_href))
+                    # Добавляем под новым ключом
+                    grouped_by_file[chapter_name] = new_entries
+                store.add(title, chapter_name, str(soup.body))
+            store.toc_update(grouped_by_file)
+            return True
+
         except Exception as e:
-            print(f"Ошибка конвертации TXT {txt_file}: {e}")
-            # Создаем пустой docx или с сообщением об ошибке, чтобы процесс не падал
-            document = Document()
-            document.add_paragraph(f"Ошибка конвертации файла {os.path.basename(txt_file)}: {e}")
-        finally:
-            document.save(docx_file)
+            print(f"Ошибка конвертации EPUB '{epub_file}': {e}")
+            return False
 
     return await run_in_threadpool(_convert)
 
@@ -406,116 +691,79 @@ async def process_files(file_list):
     converted_files = []
     for file in file_list:
         ext = os.path.splitext(file)[1].lower()
-        # Если файл уже в формате .docx – добавляем его в список
         if ext == ".docx":
-            converted_files.append(file)
-        elif ext == ".txt":
-            docx_file = os.path.splitext(file)[0] + ".docx"
-            await convert_txt_to_docx(file, docx_file)
-            converted_files.append(docx_file)
-        elif ext == ".fb2":
-            docx_file = os.path.splitext(file)[0] + ".docx"
-            await convert_fb2_to_docx(file, docx_file)
-            converted_files.append(docx_file)
-        elif ext == ".epub":
-            docx_file = os.path.splitext(file)[0] + ".docx"
-            await convert_epub_to_docx(file, docx_file)
-            converted_files.append(docx_file)
+            html_file = os.path.splitext(file)[0] + ".html"
+            html_content = await convert_docx_to_html(file, html_file)
+            if html_content == True:
+                converted_files.append(file)
+        if ext == ".txt":
+            html_file = os.path.splitext(file)[0] + ".html"
+            html_content = await convert_txt_to_html(file, html_file)
+            if html_content == True:
+                converted_files.append(file)
+        if ext == ".fb2":
+            html_file = os.path.splitext(file)[0] + ".html"
+            html_content = await convert_fb2_to_html(file, html_file)
+            if html_content == True:
+                converted_files.append(file)
+        if ext == ".epub":
+            html_file = os.path.splitext(file)[0] + ".html"
+            html_content = await convert_epub_to_html(file, html_file)
+            if html_content == True:
+                converted_files.append(file)
     return converted_files
 
 # ===================== Неблокирующие функции для работы с документами =====
-def safe_docx(doc):
-    check = Document()
-    composer = Composer(check)
-    composer.append(doc)
-    return check
-    
-def check_and_add_title(doc, file_name):
-    """
-    Проверяет первые абзацы документа на наличие заголовка (например, "Глава ...").
-    Если заголовок не найден, добавляет его на основе имени файла.
-    """
-    patterns = [
-        r'Глава[ ]{0,4}\d{1,4}',
-        r'Часть[ ]{0,4}\d{1,4}',
-        r'^Пролог[ .!]*$',
-        r'^Описание[ .!]*$',
-        r'^Аннотация[ .!]*$',
-        r'^Annotation[ .!]*$',
-        r'^Предисловие от автора[ .!]*$'
-    ]
-    if doc.paragraphs:
-        check_paragraphs = doc.paragraphs[0:4]
-        title_found = False
-        c = 0
-        for p in check_paragraphs:
-            if any(p.style.name.lower().startswith(prefix) for prefix in ["heading", "заголовок"]):
-                title_found = True
-                break
-
-        if not title_found:
-            for p in check_paragraphs:
-                for pattern in patterns:
-                    if re.search(pattern, p.text.strip()):
-                        title_found = True
-                        try:
-                            p.style = 'Heading 1'
-                        except Exception as e:
-                            try:
-                                doc = safe_docx(doc)
-                                p = doc.paragraphs[c]
-                                p.style = 'Heading 1'
-                            except Exception as e:
-                                print(f"Возникла ошибка при создании заголовка: {e}")
-                        break
-                if title_found:
-                    break
-                c = c+1
-
-        if not title_found:
-            # Добавляем заголовок перед первым абзацем
-            title = os.path.splitext(os.path.basename(file_name))[0]
-            if re.fullmatch(r'\d+', title.strip()):
-                title = 'Глава ' + title
-            try:
-                paragraph = doc.paragraphs[0].insert_paragraph_before(title)
-                paragraph.style = 'Heading 1'
-            except:
-                try:
-                    doc = safe_docx(doc)
-                    paragraph = doc.paragraphs[0]
-                    paragraph.style = 'Heading 1'
-                    return doc
-                except Exception as e:
-                    print(f"Возникла ошибка при добавлении заголовка: {e}")
-    return doc
-
 @timer
-async def merge_docx(file_list, output_file_name):
-    def _merge():
-        # Создаем новый документ
-        merged_document = Document()
-        composer = Composer(merged_document)
-        try:
-            for file in file_list:
-                try:
-                    doc = Document(file)
-                    doc = check_and_add_title(doc, file)
-                    composer.append(doc)
-                except Exception as e:
-                    print(f"Ошибка добавления файла {file}: {e}")
-                    merged_document.add_paragraph(f"Ошибка добавления файла {os.path.basename(file)}: {e}")
-        except Exception as e:
-            print(f"Критическая ошибка, невозможно пройтись по списку {file_list}: {e}")
-            merged_document.add_paragraph(f"Критическая ошибка, невозможно пройтись по списку {file_list}: {e}")
-        finally:
-            composer.save(output_file_name)
-            print(f"Файлы объединены в {output_file_name}")
-            return output_file_name
+async def generate_epub(output_filename):
+    def build_epub():
+        # Создание книги
+        book = epub.EpubBook()
+        book.set_title(output_filename)
+        toc = store.get_toc()
 
-    # Объединяем обработанные файлы в отдельном потоке
-    result = await run_in_threadpool(_merge)
-    return result
+        chapters = []
+        spine_chapters = []
+        for i, (title, chapter_name, content) in enumerate(store.iter_chapters()):
+            chapter = epub.EpubHtml(
+                title=title,
+                file_name=chapter_name,
+                content=content
+            )
+            book.add_item(chapter)
+            spine_chapters.append(chapter)
+            if chapter_name in toc:
+                # Добавляем все подглавы (title, href) из словаря toc
+                for sub_title, href in toc[chapter_name]:
+                    chapters.append(epub.Link(href, sub_title, f"sub_{i}_{href}"))
+            else:
+                chapters.append(chapter)
+
+        # Добавляем все изображения из БД
+        store.cursor.execute("SELECT name, data FROM images")
+        for name, data in store.cursor.fetchall():
+            image_item = epub.EpubItem(
+                uid=name,
+                file_name=f"images/{name}",
+                media_type="image/jpeg",
+                content=data
+            )
+            book.add_item(image_item)
+
+        # Оглавление и порядок
+        book.toc = tuple(chapters)
+        book.spine = spine_chapters
+        # Обязательные элементы
+        book.add_item(epub.EpubNcx())
+
+        # Сохраняем книгу
+        epub.write_epub(output_filename, book)
+        store.clear()
+        return output_filename
+
+    # Выполнить синхронный код в отдельном потоке
+    return await run_in_threadpool(build_epub)
+
 
 # ===================== FSM: Состояния =====================
 class MergeStates(StatesGroup):
@@ -728,7 +976,7 @@ async def end_merge(message: Message, state: FSMContext):
     keyboard.adjust(1)
 
     bot_message = await message.answer(
-        "Введите название для итогового файла или нажмите 'Пропустить' для использования стандартного имени (merged.docx):",
+        "Введите название для итогового файла или нажмите 'Пропустить' для использования стандартного имени (merged.epub):",
         reply_markup=keyboard.as_markup(resize_keyboard=True)
     )
     list_delete_message.append(bot_message.message_id)
@@ -756,9 +1004,9 @@ async def process_filename(message: Message, state: FSMContext):
 
     # Определяем имя выходного файла
     if message.text == "Пропустить":
-        output_file_name = "merged.docx"
+        output_file_name = "merged.epub"
     else:
-        output_file_name = message.text + ".docx"
+        output_file_name = message.text + ".epub"
         output_file_name = await sanitize_filename(output_file_name)
 
     # Добавляем задачу в очередь с отсортированным списком файлов
@@ -812,11 +1060,11 @@ async def process_and_merge_files_with_queue(chat_id, send_kwargs, file_list, li
     try:
         # Конвертация и объединение файлов
         converted_files = await process_files(file_list)
-        merged_file = await merge_docx(converted_files, output_file_name)
+        merged_file = await generate_epub(output_file_name)
 
         # Формируем сообщение с информацией о собранных файлах
-        file_list_str = "\n".join([os.path.basename(f) for f in file_list])
-        await bot.send_message(chat_id, f"Задача #{task_id} завершена!\nФайлы объединены в {os.path.basename(output_file_name)}.\nСобрано {len(file_list)} файлов:\n{file_list_str}", **send_kwargs)
+        file_list_str = "\n".join([os.path.basename(f) for f in converted_files])
+        await bot.send_message(chat_id, f"Задача #{task_id} завершена!\nФайлы объединены в {os.path.basename(output_file_name)}.\nСобрано {len(converted_files)} файлов:\n{file_list_str}", **send_kwargs)
 
         # Отправляем объединённый файл пользователю
         document = FSInputFile(merged_file)
@@ -852,8 +1100,6 @@ async def handle_document(message: Message, state: FSMContext):
     Если сбор файлов запущен, сохраняет полученный документ на диск
     и добавляет его имя в список для дальнейшей обработки.
     """
-    if await check_sender(message):
-        return
 
     current_state = await state.get_state()
     if current_state != MergeStates.collecting.state:
@@ -867,7 +1113,7 @@ async def handle_document(message: Message, state: FSMContext):
     base_name, extension = os.path.splitext(file_name)
     counter = 1
 
-    if extension.lower() not in (".docx", ".fb2", ".txt", ".epub"):
+    if extension.lower() not in (".docx", ".txt", ".fb2", ".epub"):
         bot_message = await message.answer(f"Неизвестный формат файла: {message.document.file_name}. Пожалуйста, отправляйте файлы только в форматах docx, fb2, epub, txt.")
         asyncio.create_task(delete_message_after_delay(bot_message, delay=10))
         return
@@ -909,12 +1155,16 @@ async def handle_document(message: Message, state: FSMContext):
         # Теперь храним кортеж (имя_файла, id_сообщения)
         file_list.append((file_name, message.message_id))
         await state.update_data(file_list=file_list)
-
         # Сообщаем о лимитах
-        bot_message = await message.answer(
-            f"Файл {file_name} сохранён! Всего файлов: {len(file_list)}\n"
-            f"Использовано сегодня: {files_today_count}/{max_files}" # Показываем актуальное число
-        )
+        chat_type = message.chat.type
+        if chat_type in ("group", "supergroup"):
+            text = f"Файл {file_name} сохранён! Всего файлов: {len(file_list)}\nИспользовано сегодня: {files_today_count}/{max_files}" # Показываем актуальное число
+            bot_message = await enqueue_group_message(message.chat.id, message, text)
+        else:
+            bot_message = await message.answer(
+                f"Файл {file_name} сохранён! Всего файлов: {len(file_list)}\n"
+                f"Использовано сегодня: {files_today_count}/{max_files}" # Показываем актуальное число
+            )
         list_delete_message.append(bot_message.message_id)
         await state.update_data(list_delete_message=list_delete_message)
     except Exception as e:
@@ -936,7 +1186,7 @@ async def send_info(message: Message):
     max_size = user_limits.max_size
 
     bot_message = await message.answer(
-        "📚 Бот для объединения файлов (DOCX, FB2, EPUB, TXT).\n\n"
+        "📚 Бот для объединения файлов (DOCX, TXT, FB2, EPUB).\n\n"
         "Лимиты:\n"
         f"• {max_files} файлов в сутки (сброс в 00:00 UTC)\n"
         f"• Макс. размер файла: {max_size} MB\n\n"
