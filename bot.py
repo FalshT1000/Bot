@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # Установка зависимостей
+!pip install python-docx docxcompose beautifulsoup4 ebooklib aiogram aiofiles nest_asyncio mammoth chardet
 import mammoth
 import os
 import re
@@ -336,7 +337,7 @@ def timer(func):
     return wrapper
 
 # Замените токен на свой
-API_TOKEN = os.getenv("API_TOKEN") 
+API_TOKEN = '7885126039:AAEzZPYvJhN2rncjtSiYPGa194cDEcZODyE'
 bot = Bot(token=API_TOKEN)
 router = Router()
 
