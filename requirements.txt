@@ -8,3 +8,5 @@ nest_asyncio
 pillow
 mammoth
 chardet
+fastapi
+uvicorn
