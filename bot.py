@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 # Установка зависимостей
-!pip install python-docx docxcompose beautifulsoup4 ebooklib aiogram aiofiles nest_asyncio mammoth chardet
 import mammoth
 import os
 import re
