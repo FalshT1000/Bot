@@ -6,3 +6,5 @@ aiogram
 aiofiles
 nest_asyncio
 pillow
+mammoth
+chardet
