@@ -536,7 +536,8 @@ async def convert_fb2_to_html(fb2_file, output_html_filename):
             # Парсим остальные части документа
             for element in soup.find_all(['title', 'p', 'image']):
                 if element.name == 'title':
-                    html_lines.append(f"<h1>{html.escape(element.get_text())}</h1>")
+                    t = html.escape(element.get_text())
+                    html_lines.append(f"<h1>{t}</h1>")
                 elif element.name == 'p':
                     # print(element)
                     # Если абзац не является частью title или annotation
