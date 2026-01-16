@@ -512,13 +512,13 @@ async def convert_txt_to_html(txt_file, output_html_filename):
 async def convert_fb2_to_html(fb2_file, output_html_filename):
     def _convert():
         html_lines = []
-        image_data_map = {} # Словарь для раскодированных изображений {id: image_bytes}
+        image_data_map = {}  # Словарь для раскодированных изображений {id: image_bytes}
         try:
             encoding = detect_encoding(fb2_file)
             with open(fb2_file, 'r', encoding=encoding) as f:
                 content = f.read()
             soup = BeautifulSoup(content, 'html')
-            # print(soup)
+
             # Извлечение и декодирование всех изображений
             for binary_tag in soup.find_all('binary'):
                 image_id = binary_tag.get('id')
@@ -527,33 +527,40 @@ async def convert_fb2_to_html(fb2_file, output_html_filename):
                 if image_id and data and content_type.startswith('image/'):
                     try:
                         buf = io.BytesIO()
-                        Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB").save(buf, format="JPEG", quality=70)
+                        Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB").save(buf, format="JPEG",
+                                                                                           quality=70)
                         buf.seek(0)
                         image_name = store.save_image(buf.read())
                         image_data_map[image_id] = f"images/{image_name}"
                     except Exception as img_e:
                         print(f"FB2: Ошибка добавления изображения '{image_id}' в БД: {img_e}")
+
+            # Функция для рекурсивного обхода тегов <p>
+            def render_inline(element):
+                paragraph = ''
+                for sub in element.contents:
+                    if isinstance(sub, NavigableString):
+                        paragraph += html.escape(str(sub))
+                    elif isinstance(sub, Tag):
+                        content = render_inline(sub)
+                        if sub.name == 'strong':
+                            paragraph += f"<b>{content}</b>"
+                        elif sub.name == 'emphasis':
+                            paragraph += f"<i>{content}</i>"
+                        else:
+                            paragraph += content  # Игнорируем неизвестный тег, но берем текст
+                return "".join(paragraph)
+
             # Парсим остальные части документа
             for element in soup.find_all(['title', 'p', 'image']):
                 if element.name == 'title':
                     t = html.escape(element.get_text())
                     html_lines.append(f"<h1>{t}</h1>")
                 elif element.name == 'p':
-                    # print(element)
                     # Если абзац не является частью title или annotation
                     if element.find_parent(['title', 'annotation']) is None:
-                        paragraph = ""
-                        for sub in element.contents:
-                            if hasattr(sub, 'name'):
-                                if sub.name == 'strong':
-                                    paragraph = paragraph + (f"<strong>{html.escape(sub.get_text())}</strong>")
-                                elif sub.name == 'emphasis':
-                                    paragraph = paragraph + (f"<em>{html.escape(sub.get_text())}</em>")
-                                else:
-                                    paragraph = paragraph + html.escape(sub.get_text())
-                            else:
-                                paragraph = paragraph + html.escape(sub)
-                        html_lines.append(f"<p>{paragraph}</p>")
+                        html_lines.append(f"<p>{render_inline(element)}</p>")
+
                 # Обработка тега image
                 elif element.name == 'image':
                     href_attr = element.get('l:href') or element.get('xlink:href')
@@ -566,13 +573,15 @@ async def convert_fb2_to_html(fb2_file, output_html_filename):
                             print(f"FB2: Данные для изображения '{image_id_ref}' не найдены.")
                     else:
                         print(f"FB2: Тег <image> без корректной ссылки: {element}")
-            # print(html_lines)
+
             split_html("".join(html_lines), output_html_filename)
             return True
         except Exception as e:
             print(f"Ошибка конвертации FB2 {fb2_file}: {e}")
             return False
+
     return await run_in_threadpool(_convert)
+
 
 async def convert_epub_to_html(epub_file, output_html_filename):
     def _convert():
