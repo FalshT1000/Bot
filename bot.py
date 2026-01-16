@@ -17,7 +17,7 @@ import base64
 import posixpath
 import sqlite3
 from docxcompose.composer import Composer
-from bs4 import BeautifulSoup, Tag, NavigableStringimport ebooklib
+from bs4 import BeautifulSoup, Tag, NavigableStringimport
 from ebooklib import epub
 from aiogram import Bot, Router, types, F, Dispatcher
 from aiogram.types import Message, FSInputFile, BotCommand, BotCommandScopeDefault, BotCommandScopeAllGroupChats
