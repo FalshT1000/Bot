@@ -444,6 +444,7 @@ def split_html(raw_html, file_name):
                     # print(title, chapter_name, "".join(str(e) for e in current_chapter))
                     current_chapter = []
             title = elem.text
+            print('title: ', title)
         current_chapter.append(elem)
 
     # Последняя глава
