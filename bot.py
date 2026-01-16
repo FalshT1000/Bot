@@ -518,7 +518,7 @@ async def convert_fb2_to_html(fb2_file, output_html_filename):
             encoding = detect_encoding(fb2_file)
             with open(fb2_file, 'r', encoding=encoding) as f:
                 content = f.read()
-            soup = BeautifulSoup(content, 'html')
+            soup = BeautifulSoup(content, 'xml')
 
             # Извлечение и декодирование всех изображений
             for binary_tag in soup.find_all('binary'):
