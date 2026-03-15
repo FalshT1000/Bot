@@ -584,9 +584,24 @@ async def convert_fb2_to_html(fb2_file, output_html_filename):
 
 
 async def convert_epub_to_html(epub_file, output_html_filename):
+    def _fix_and_read_epub(epub_file):
+        for _ in range(20):
+            try:
+                return epub.read_epub(epub_file)
+            except KeyError as e:
+                # Извлекаем путь из строки вида: There is no item named 'OEBPS/...' in the archive
+                missing = str(e).split("'")[1]
+                if not missing:
+                    raise  # неизвестный KeyError, пробрасываем дальше
+                print(f"EPUB: добавляем недостающий файл '{missing}'")
+                with zipfile.ZipFile(epub_file, 'a') as zf:
+                    if missing not in zf.namelist():
+                        zf.writestr(missing, "")
+        raise RuntimeError("Не удалось починить EPUB за 20 итераций")
+
     def _convert():
         try:
-            book = epub.read_epub(epub_file)
+            book = _fix_and_read_epub(epub_file)
             # Извлекаем оглавление и создаём grouped_by_file
             def flatten_toc(toc):
                 result = []
