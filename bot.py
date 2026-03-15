@@ -3,6 +3,7 @@
 
 # Установка зависимостей
 import mammoth
+import zipfile
 import os
 import re
 import time
