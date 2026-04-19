@@ -1094,7 +1094,7 @@ async def process_and_merge_files_with_queue(chat_id, send_kwargs, file_list, li
 
         # Отправляем объединённый файл пользователю
         document = FSInputFile(merged_file)
-        caption = "@Merge_ConvertBot\n" + os.path.splitext(output_file_name)[0]
+        caption = "@Merge_ConvertBot\n" + f"<code>{os.path.splitext(output_file_name)[0]}</code>"
         await bot.send_document(chat_id, document=document, caption=caption, **send_kwargs)
 
         # Удаляем объединенный файл после отправки
